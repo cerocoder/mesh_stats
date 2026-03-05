@@ -1077,7 +1077,7 @@ class MeshStatsTUI:
         self._detail_lines_cache: Optional[List[Tuple[str, int]]] = None
         self._detail_cache_node_byte: Optional[int] = None
 
-    def init_colors(self) -> None:  # pylint: disable=no-self-use
+    def init_colors(self) -> None:
         """Initialize color pairs for the TUI.
 
         Color pairs are defined using constants at the top of the file
