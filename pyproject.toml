@@ -1,0 +1,9 @@
+[tool.pylint.'MESSAGES CONTROL']
+disable = [
+  "line-too-long",
+  "too-many-lines",
+  "invalid-name",
+  "too-many-instance-attributes",
+  "too-many-arguments",
+  "broad-except",
+]
