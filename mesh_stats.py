@@ -1514,12 +1514,10 @@ class MeshStatsTUI:
                     if "hwModel" in user:
                         lines.append((f"    Hardware: {user['hwModel']}", CP_NORMAL))
                     role = user.get("role") or user.get("deviceRole")
-                    if role is not None:
-                        lines.append((f"    Role: {role}", CP_NORMAL))
-                if role is None or (isinstance(role, str) and not role.strip()):
-                    role = node_info.get("role") or node_info.get("deviceRole")
-                    if role is not None:
-                        lines.append((f"    Role: {role}", CP_NORMAL))
+                    if role is None:
+                        # Default role name is CLIENT
+                        role = 'CLIENT'
+                    lines.append((f"    Role: {role}", CP_NORMAL))
 
                 # Distance, altitude and bearing from get_node_location_info when we have current_pos
                 loc = self.stats.get_node_location_info(node_num, current_pos)
