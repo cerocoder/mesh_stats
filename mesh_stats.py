@@ -13,13 +13,12 @@ import pickle
 import sys
 import threading
 import time
-import meshtastic.serial_interface
-import meshtastic.ble_interface
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, Union
 from datetime import datetime
 from decimal import Decimal
-
+from typing import Dict, List, Optional, Tuple
+import meshtastic.serial_interface
+import meshtastic.ble_interface
 from pubsub import pub
 
 # Signal bar scale constants (easily modifiable)
@@ -92,6 +91,21 @@ def haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> fl
 
     return R * c
 
+def obfuscation_radius_meters(precision_bits: Optional[int]) -> Optional[float]:
+    """Meshtastic position obfuscation radius in meters from precision_bits.
+
+    Uses the standard relationship: radius decreases by ~half per bit.
+    Returns None if precision_bits is None or 0 (unknown/location not sent).
+    """
+    if precision_bits is None or precision_bits <= 0:
+        return None
+    return 23905784.0 / (2 ** precision_bits)
+
+def bearing_to_direction(bearing_deg: float) -> str:
+    """Map bearing in degrees (0=N, 90=E, 180=S, 270=W) to N, NE, E, SE, S, SW, W, NW."""
+    bearing_deg = bearing_deg % 360.0
+    sector = (bearing_deg + 22.5) % 360 // 45
+    return ("N", "NE", "E", "SE", "S", "SW", "W", "NW")[int(sector)]
 
 @dataclass
 class SignalStats:
@@ -102,8 +116,8 @@ class SignalStats:
     count: int = 0
     last_val: float = 0.0
 
-    def update(self, value: float) -> None:
-        """Update statistics with a new value."""
+    def update(self, _timestamp: float, value: float) -> None:
+        """Update statistics with a new value. _timestamp is just ignored now"""
         self.min_val = min(self.min_val, value)
         self.max_val = max(self.max_val, value)
         self.sum_val += value
@@ -131,7 +145,7 @@ class SignalHistoryStat(SignalStats):
 
     def update(self, timestamp: float, value: float) -> None:
         """Update with a new (timestamp, value). Caller passes local time."""
-        super().update(value)
+        super().update(timestamp, value)
         self.history.append((timestamp, value))
 
     def reset(self) -> None:
@@ -200,7 +214,7 @@ class NodePositionHistory:
         """Get the best topical position."""
         def good_pos(p):
             return p.has_coordinates() and p.has_altitude()
-        # return last_position 
+        # return last_position
         last_pos = self.last_position
         if last_pos:
             if good_pos(last_pos):
@@ -301,9 +315,9 @@ class RelayNodeStats:
             self.from_node_stats[from_node].update(hop_start, hop_limit)
 
         if rx_snr is not None:
-            self.snr.update(rx_snr)
+            self.snr.update(now, rx_snr)
         if rx_rssi is not None:
-            self.rssi.update(float(rx_rssi))
+            self.rssi.update(now, float(rx_rssi))
 
     @property
     def packets_per_hour(self) -> float:
@@ -332,7 +346,25 @@ class RelayNodeStats:
         self.from_node_stats.clear()
 
 
-class StatsCollector:
+def get_last_byte_of_node_num(node_num: int) -> int:
+    """Get last byte of node number, following firmware logic.
+
+    Returns (node_num & 0xFF), or 0xFF if that would be 0.
+    """
+    last_byte = node_num & 0xFF
+    return 0xFF if last_byte == 0 else last_byte
+
+def _get_telemetry_val(d: Dict, key: str, default=None):
+    """Get value from dict trying key and camelCase variant."""
+    if d is None:
+        return default
+    if key in d:
+        return d[key]
+    parts = key.split("_")
+    camel = parts[0].lower() + "".join(p.capitalize() for p in parts[1:])
+    return d.get(camel, default)
+
+class StatsCollector:  # pylint: disable=too-many-public-methods
     """Collects and manages statistics for all relay nodes."""
 
     def __init__(self, meshview_url: Optional[str] = None):
@@ -417,8 +449,8 @@ class StatsCollector:
         if self.interface is None:
             return False
         try:
-            # Request fresh config from device
-            self.interface._startConfig()
+            # Request fresh config from device (meshtastic API uses _startConfig)
+            getattr(self.interface, '_startConfig', lambda: None)()
             # Wait for config to complete
             self.interface.waitForConfig()
             # Wait for node DB to stop growing (nodes stream in after config)
@@ -459,6 +491,14 @@ class StatsCollector:
     def get_db_cnt(self) -> int:
         """ Get count of records in the local node DB """
         return len(self._nodes_by_num)
+
+    def get_nodes(self) -> Dict:
+        """Return the node database snapshot (node_num -> node_info) for lookups."""
+        return self._nodes_by_num
+
+    def get_node_telemetry(self) -> Dict:
+        """Return per-node telemetry records (node_num -> NodeTelemetryRecord)."""
+        return self._node_telemetry
 
     def get_local_node_position(self) -> Optional[Tuple[float, float]]:
         """Get local node's position (latitude, longitude).
@@ -506,7 +546,6 @@ class StatsCollector:
         with self.lock:
             if self.last_packet_time is None:
                 return "N/A"
-            from datetime import datetime
             dt = datetime.fromtimestamp(self.last_packet_time)
             return dt.strftime("%H:%M:%S")
 
@@ -515,21 +554,12 @@ class StatsCollector:
         with self.lock:
             if self.last_relayed_packet_time is None:
                 return "N/A"
-            from datetime import datetime
             dt = datetime.fromtimestamp(self.last_relayed_packet_time)
             return dt.strftime("%H:%M:%S")
 
     def set_interface(self, interface) -> None:
         """Set the meshtastic interface for node info lookups."""
         self.interface = interface
-
-    def get_last_byte_of_node_num(self, node_num: int) -> int:
-        """Get last byte of node number, following firmware logic.
-
-        Returns (node_num & 0xFF), or 0xFF if that would be 0.
-        """
-        last_byte = node_num & 0xFF
-        return 0xFF if last_byte == 0 else last_byte
 
     def find_matching_nodes(self, relay_node_byte: int) -> List[Dict]:
         """Find all nodes in database whose last byte matches relay_node_byte.
@@ -546,7 +576,7 @@ class StatsCollector:
         # Use snapshot; no lock needed (reference read is safe; dict is only replaced in reload_node_database)
         nodes_snapshot = self._nodes_by_num
         for node_num, node_info in nodes_snapshot.items():
-            if self.get_last_byte_of_node_num(node_num) == relay_node_byte:
+            if get_last_byte_of_node_num(node_num) == relay_node_byte:
                 if not self.skip_relays.get(node_num, False):
                     matches.append(node_info)
         return matches
@@ -568,10 +598,6 @@ class StatsCollector:
                 if short_name:
                     return short_name
         return ""
-
-    def get_relay_node_hex(self, relay_node_byte: int) -> str:
-        """Get hex representation of relay node byte."""
-        return f"0x{relay_node_byte:02x}"
 
     def get_node_info(self, relay_node_byte: int) -> Optional[Dict]:
         """Get full node info if exactly one match exists."""
@@ -617,23 +643,7 @@ class StatsCollector:
         history = self.get_node_position_history(node_num)
         return history.best_position if history else None
 
-    def _obfuscation_radius_meters(self, precision_bits: Optional[int]) -> Optional[float]:
-        """Meshtastic position obfuscation radius in meters from precision_bits.
-
-        Uses the standard relationship: radius decreases by ~half per bit.
-        Returns None if precision_bits is None or 0 (unknown/location not sent).
-        """
-        if precision_bits is None or precision_bits <= 0:
-            return None
-        return 23905784.0 / (2 ** precision_bits)
-
-    def _bearing_to_direction(self, bearing_deg: float) -> str:
-        """Map bearing in degrees (0=N, 90=E, 180=S, 270=W) to N, NE, E, SE, S, SW, W, NW."""
-        bearing_deg = bearing_deg % 360.0
-        sector = (bearing_deg + 22.5) % 360 // 45
-        return ("N", "NE", "E", "SE", "S", "SW", "W", "NW")[int(sector)]
-
-    def get_node_location_info(
+    def get_node_location_info(  # pylint: disable=too-many-locals
         self,
         node_num: int,
         current_position: Optional[Tuple[float, float]] = None,
@@ -702,7 +712,7 @@ class StatsCollector:
         if node_lat is None or node_lon is None:
             return result
 
-        obf_radius = self._obfuscation_radius_meters(precision_bits)
+        obf_radius = obfuscation_radius_meters(precision_bits)
         result["obfuscation_radius"] = obf_radius
 
         if local_lat is not None and local_lon is not None:
@@ -718,23 +728,15 @@ class StatsCollector:
                 y = math.sin(dlon_rad) * math.cos(lat2_rad)
                 x = math.cos(lat1_rad) * math.sin(lat2_rad) - math.sin(lat1_rad) * math.cos(lat2_rad) * math.cos(dlon_rad)
                 bearing_deg = math.degrees(math.atan2(y, x)) % 360.0
-                result["direction"] = self._bearing_to_direction(bearing_deg)
+                result["direction"] = bearing_to_direction(bearing_deg)
 
         result["lat"], result["lon"] = node_lat, node_lon
-        
+
         return result
 
-    def _get_telemetry_val(self, d: Dict, key: str, default=None):
-        """Get value from dict trying key and camelCase variant."""
-        if d is None:
-            return default
-        if key in d:
-            return d[key]
-        parts = key.split("_")
-        camel = parts[0].lower() + "".join(p.capitalize() for p in parts[1:])
-        return d.get(camel, default)
-
-    def _process_telemetry_packet(self, node_num: int, decoded: Dict, timestamp: float) -> None:
+    def _process_telemetry_packet(  # pylint: disable=too-many-locals,too-many-nested-blocks,too-many-branches,too-many-statements
+        self, node_num: int, decoded: Dict, timestamp: float
+    ) -> None:
         """Process TELEMETRY_APP packet: update _node_telemetry and optionally _local_stats_last."""
         telemetry = decoded.get("telemetry") or decoded
         with self.lock:
@@ -745,7 +747,7 @@ class StatsCollector:
             # DeviceMetrics
             dm = telemetry.get("device_metrics") or telemetry.get("deviceMetrics")
             if dm is not None:
-                uptime = self._get_telemetry_val(dm, "uptime_seconds")
+                uptime = _get_telemetry_val(dm, "uptime_seconds")
                 if uptime is not None:
                     try:
                         uptime = int(uptime)
@@ -760,7 +762,7 @@ class StatsCollector:
                     ("channel_utilization", "channel_utilization"),
                     ("air_util_tx", "air_util_tx"),
                 ):
-                    val = self._get_telemetry_val(dm, proto_key)
+                    val = _get_telemetry_val(dm, proto_key)
                     if val is not None:
                         try:
                             v = float(val)
@@ -778,7 +780,7 @@ class StatsCollector:
                     ("voltage", "voltage"),
                     ("current", "current"),
                 ):
-                    val = self._get_telemetry_val(em, proto_key)
+                    val = _get_telemetry_val(em, proto_key)
                     if val is not None:
                         try:
                             v = float(val)
@@ -794,7 +796,7 @@ class StatsCollector:
                 for ch in range(1, 9):
                     for suf, proto in (("voltage", f"ch{ch}_voltage"), ("current", f"ch{ch}_current")):
                         key = f"ch{ch}_{suf}"
-                        val = self._get_telemetry_val(pm, proto)
+                        val = _get_telemetry_val(pm, proto)
                         if val is not None:
                             try:
                                 v = float(val)
@@ -812,7 +814,7 @@ class StatsCollector:
                 if my_node is not None and node_num == my_node:
                     self._local_stats_last = dict(ls)
 
-    def on_receive(self, packet, interface) -> None:
+    def on_receive(self, packet, _interface) -> None:  # pylint: disable=too-many-locals,too-many-branches,too-many-statements
         """Handle received packet from meshtastic.
 
         Updates spinner and timestamps for all packets.
@@ -840,7 +842,7 @@ class StatsCollector:
             if position_data:
                 self.store_position(from_node, position_data)
 
-        if portnum == "TELEMETRY_APP" or portnum == 67:
+        if portnum in ("TELEMETRY_APP", 67):
             if from_node is not None:
                 self._process_telemetry_packet(from_node, decoded, current_time)
 
@@ -951,6 +953,113 @@ class StatsCollector:
             return self.paused
 
 
+def value_to_bar_position(value: float, scale_min: float, scale_max: float) -> int:
+    """Convert a value to bar position (0 to BAR_WIDTH-1)."""
+    if value <= scale_min:
+        return 0
+    if value >= scale_max:
+        return BAR_WIDTH - 1
+    ratio = (value - scale_min) / (scale_max - scale_min)
+    return int(ratio * (BAR_WIDTH - 1))
+
+def render_bar_simple(win, y: int, x: int, stats: SignalStats,
+                        scale_min: float, scale_max: float,
+                        color_bar: int) -> None:
+    """Render a simple signal bar showing only the current level.
+
+    Args:
+        win: Curses window to draw on
+        y, x: Position to draw at
+        stats: Signal statistics to visualize
+        scale_min, scale_max: Fixed scale range
+        color_bar: Color pair ID for bar fill
+    """
+    if stats.count == 0:
+        # No data yet
+        bar_str = " " * BAR_WIDTH
+        win.addstr(y, x, bar_str)
+        return
+    # Calculate position of last value
+    last_pos = value_to_bar_position(stats.last_val, scale_min, scale_max)
+    # Build the bar: fill from left edge to last_pos
+    for i in range(BAR_WIDTH):
+        if i <= last_pos:
+            char = '█'
+            attr = curses.color_pair(color_bar)
+        else:
+            char = ' '
+            attr = curses.color_pair(COLOR_NORMAL)
+        try:
+            win.addch(y, x + i, char, attr)
+        except curses.error:
+            pass  # Ignore errors at screen edge
+
+def render_bar_complex(  # pylint: disable=too-many-locals,too-many-branches
+    win, y: int, x: int, stats: SignalStats,
+    scale_min: float, scale_max: float,
+    color_bar: int, color_indicator: int, color_indicator_flash: int,
+    flash_last: bool = False, fill_from_zero: bool = False
+) -> None:
+    """Render a complex signal bar with min/max range, average and last indicators.
+    Args:
+        win: Curses window to draw on
+        y, x: Position to draw at
+        stats: Signal statistics to visualize
+        scale_min, scale_max: Fixed scale range
+        color_bar: Color pair ID for bar fill
+        color_indicator: Color pair ID for indicators (| and *)
+        color_indicator_flash: Color pair ID for '*' when flashing
+        flash_last: If True, show '*' (last value) in flash color
+        fill_from_zero: If True, fill bar from left edge to last_pos (like simple mode)
+    """
+    if stats.count == 0:
+        # No data yet
+        bar_str = " " * BAR_WIDTH
+        win.addstr(y, x, bar_str)
+        return
+    # Calculate positions
+    min_pos = value_to_bar_position(stats.min_val, scale_min, scale_max)
+    max_pos = value_to_bar_position(stats.max_val, scale_min, scale_max)
+    avg_pos = value_to_bar_position(stats.avg, scale_min, scale_max)
+    last_pos = value_to_bar_position(stats.last_val, scale_min, scale_max)
+    # Determine fill range
+    if fill_from_zero:
+        fill_start = 0
+        fill_end = last_pos
+    else:
+        fill_start = min_pos
+        fill_end = max_pos
+    # Build the bar character by character
+    for i in range(BAR_WIDTH):
+        char = ' '
+        attr = curses.color_pair(COLOR_NORMAL)  # Default
+        # Check if within the fill range
+        if fill_start <= i <= fill_end:
+            # Background fill
+            char = '█'
+            attr = curses.color_pair(color_bar)
+            # Check for indicators
+            if i == avg_pos and i == last_pos:
+                char = '*'
+                if flash_last:
+                    attr = curses.color_pair(color_indicator_flash) | curses.A_BOLD
+                else:
+                    attr = curses.color_pair(color_indicator) | curses.A_BOLD
+            elif i == last_pos:
+                char = '*'
+                if flash_last:
+                    attr = curses.color_pair(color_indicator_flash) | curses.A_BOLD
+                else:
+                    attr = curses.color_pair(color_indicator) | curses.A_BOLD
+            elif i == avg_pos:
+                char = '|'
+                attr = curses.color_pair(color_indicator) | curses.A_BOLD
+        try:
+            win.addch(y, x + i, char, attr)
+        except curses.error:
+            pass  # Ignore errors at screen edge
+
+
 class MeshStatsTUI:
     """Curses-based TUI for displaying relay node statistics."""
 
@@ -968,7 +1077,7 @@ class MeshStatsTUI:
         self._detail_lines_cache: Optional[List[Tuple[str, int]]] = None
         self._detail_cache_node_byte: Optional[int] = None
 
-    def init_colors(self) -> None:
+    def init_colors(self) -> None:  # pylint: disable=no-self-use
         """Initialize color pairs for the TUI.
 
         Color pairs are defined using constants at the top of the file
@@ -1006,7 +1115,7 @@ class MeshStatsTUI:
         # COLOR_MY_NODE: Local node info highlight
         curses.init_pair(COLOR_MY_NODE, curses.COLOR_CYAN, -1)
 
-    def render_my_info(self, win, row: int, max_width: int) -> None:
+    def render_my_info(self, win, row: int, _max_width: int) -> None:
         """Render one line with local node short name and geo info (position oneline), above headers.
 
         Gets node_num from getMyNodeInfo(), then get_node_location_info(node_num, current_pos)
@@ -1033,122 +1142,10 @@ class MeshStatsTUI:
         except curses.error:
             pass
 
-    def value_to_bar_position(self, value: float, scale_min: float, scale_max: float) -> int:
-        """Convert a value to bar position (0 to BAR_WIDTH-1)."""
-        if value <= scale_min:
-            return 0
-        if value >= scale_max:
-            return BAR_WIDTH - 1
-        ratio = (value - scale_min) / (scale_max - scale_min)
-        return int(ratio * (BAR_WIDTH - 1))
-
-    def render_bar_simple(self, win, y: int, x: int, stats: SignalStats,
-                          scale_min: float, scale_max: float,
-                          color_bar: int) -> None:
-        """Render a simple signal bar showing only the current level.
-
-        Args:
-            win: Curses window to draw on
-            y, x: Position to draw at
-            stats: Signal statistics to visualize
-            scale_min, scale_max: Fixed scale range
-            color_bar: Color pair ID for bar fill
-        """
-        if stats.count == 0:
-            # No data yet
-            bar_str = " " * BAR_WIDTH
-            win.addstr(y, x, bar_str)
-            return
-
-        # Calculate position of last value
-        last_pos = self.value_to_bar_position(stats.last_val, scale_min, scale_max)
-
-        # Build the bar: fill from left edge to last_pos
-        for i in range(BAR_WIDTH):
-            if i <= last_pos:
-                char = '█'
-                attr = curses.color_pair(color_bar)
-            else:
-                char = ' '
-                attr = curses.color_pair(COLOR_NORMAL)
-
-            try:
-                win.addch(y, x + i, char, attr)
-            except curses.error:
-                pass  # Ignore errors at screen edge
-
-    def render_bar_complex(self, win, y: int, x: int, stats: SignalStats,
-                           scale_min: float, scale_max: float,
-                           color_bar: int, color_indicator: int, color_indicator_flash: int,
-                           flash_last: bool = False, fill_from_zero: bool = False) -> None:
-        """Render a complex signal bar with min/max range, average and last indicators.
-
-        Args:
-            win: Curses window to draw on
-            y, x: Position to draw at
-            stats: Signal statistics to visualize
-            scale_min, scale_max: Fixed scale range
-            color_bar: Color pair ID for bar fill
-            color_indicator: Color pair ID for indicators (| and *)
-            color_indicator_flash: Color pair ID for '*' when flashing
-            flash_last: If True, show '*' (last value) in flash color
-            fill_from_zero: If True, fill bar from left edge to last_pos (like simple mode)
-        """
-        if stats.count == 0:
-            # No data yet
-            bar_str = " " * BAR_WIDTH
-            win.addstr(y, x, bar_str)
-            return
-
-        # Calculate positions
-        min_pos = self.value_to_bar_position(stats.min_val, scale_min, scale_max)
-        max_pos = self.value_to_bar_position(stats.max_val, scale_min, scale_max)
-        avg_pos = self.value_to_bar_position(stats.avg, scale_min, scale_max)
-        last_pos = self.value_to_bar_position(stats.last_val, scale_min, scale_max)
-
-        # Determine fill range
-        if fill_from_zero:
-            fill_start = 0
-            fill_end = last_pos
-        else:
-            fill_start = min_pos
-            fill_end = max_pos
-
-        # Build the bar character by character
-        for i in range(BAR_WIDTH):
-            char = ' '
-            attr = curses.color_pair(COLOR_NORMAL)  # Default
-
-            # Check if within the fill range
-            if fill_start <= i <= fill_end:
-                # Background fill
-                char = '█'
-                attr = curses.color_pair(color_bar)
-
-                # Check for indicators
-                if i == avg_pos and i == last_pos:
-                    char = '*'
-                    if flash_last:
-                        attr = curses.color_pair(color_indicator_flash) | curses.A_BOLD
-                    else:
-                        attr = curses.color_pair(color_indicator) | curses.A_BOLD
-                elif i == last_pos:
-                    char = '*'
-                    if flash_last:
-                        attr = curses.color_pair(color_indicator_flash) | curses.A_BOLD
-                    else:
-                        attr = curses.color_pair(color_indicator) | curses.A_BOLD
-                elif i == avg_pos:
-                    char = '|'
-                    attr = curses.color_pair(color_indicator) | curses.A_BOLD
-
-            try:
-                win.addch(y, x + i, char, attr)
-            except curses.error:
-                pass  # Ignore errors at screen edge
-
-    def render_node_row(self, win, row: int, node: RelayNodeStats,
-                        total_relayed: int, is_selected: bool, max_width: int) -> None:
+    def render_node_row(  # pylint: disable=too-many-locals,too-many-branches,too-many-statements
+        self, win, row: int, node: RelayNodeStats,
+        total_relayed: int, is_selected: bool, max_width: int
+    ) -> None:
         """Render two rows for a single relay node (rxSnr and rxRssi).
 
         Row 1: Hex ID of relay byte, packet count, rxSnr stats, rxSnr bar
@@ -1183,8 +1180,8 @@ class MeshStatsTUI:
         current_pos = self.stats.get_local_node_position()
         if match_count == 1 and current_pos:
             node_num = next(
-                (n for n in self.stats._nodes_by_num
-                 if self.stats.get_last_byte_of_node_num(n) == node.relay_node_byte),
+                (n for n in self.stats.get_nodes()
+                 if get_last_byte_of_node_num(n) == node.relay_node_byte),
                 None
             )
             if node_num is not None:
@@ -1228,10 +1225,10 @@ class MeshStatsTUI:
         # rxSnr bar (no selection highlight, green color scheme)
         if bar_col + BAR_WIDTH < max_width:
             if self.vis_mode == VIS_MODE_SIMPLE:
-                self.render_bar_simple(win, row, bar_col, node.snr,
+                render_bar_simple(win, row, bar_col, node.snr,
                                        SNR_SCALE_MIN, SNR_SCALE_MAX, COLOR_SNR_BAR)
             else:
-                self.render_bar_complex(win, row, bar_col, node.snr,
+                render_bar_complex(win, row, bar_col, node.snr,
                                         SNR_SCALE_MIN, SNR_SCALE_MAX,
                                         COLOR_SNR_BAR, COLOR_SNR_INDICATOR,
                                         COLOR_SNR_INDICATOR_FLASH, node.just_received)
@@ -1289,10 +1286,10 @@ class MeshStatsTUI:
         # rxRssi bar (no selection highlight, cyan color scheme)
         if bar_col + BAR_WIDTH < max_width:
             if self.vis_mode == VIS_MODE_SIMPLE:
-                self.render_bar_simple(win, row2, bar_col, node.rssi,
+                render_bar_simple(win, row2, bar_col, node.rssi,
                                        RSSI_SCALE_MIN, RSSI_SCALE_MAX, COLOR_RSSI_BAR)
             else:
-                self.render_bar_complex(win, row2, bar_col, node.rssi,
+                render_bar_complex(win, row2, bar_col, node.rssi,
                                         RSSI_SCALE_MIN, RSSI_SCALE_MAX,
                                         COLOR_RSSI_BAR, COLOR_RSSI_INDICATOR,
                                         COLOR_RSSI_INDICATOR_FLASH, node.just_received)
@@ -1300,7 +1297,6 @@ class MeshStatsTUI:
         # Last packet timestamp (row 1) and time since (row 2)
         if last_col < max_width - 8:
             if node.last_packet_time > 0:
-                from datetime import datetime
                 # Row 1: timestamp HH:MM:SS
                 dt = datetime.fromtimestamp(node.last_packet_time)
                 time_str = dt.strftime("%H:%M:%S")
@@ -1326,7 +1322,7 @@ class MeshStatsTUI:
                 except curses.error:
                     pass
 
-    def render_header(self, win, max_width: int) -> None:
+    def render_header(self, win, max_width: int) -> None:  # pylint: disable=too-many-locals
         """Render the header section."""
         total = self.stats.get_total_packets()
         total_relayed = self.stats.get_total_relayed_packets()
@@ -1399,18 +1395,21 @@ class MeshStatsTUI:
         except curses.error:
             pass
 
-    def render_position_oneline(self, node_num, loc_info: Dict, prefix: str) -> Optional[str]:
-        lat, lon = loc_info.get("lat"), loc_info.get("lon"),
+    def render_position_oneline(  # pylint: disable=too-many-locals,too-many-branches
+        self, node_num, loc_info: Dict, prefix: str
+    ) -> Optional[str]:
+        """Format node position and optional distance/altitude/source as a single line string."""
+        lat, lon = loc_info.get("lat"), loc_info.get("lon")
         dist, alt = loc_info.get("distance"), loc_info.get("altitude")
-        dir = loc_info.get("direction")
+        direction = loc_info.get("direction")
         obfs_rad = loc_info.get("obfuscation_radius")
         src = loc_info.get("src")
         result = prefix
         if lat is not None and lon is not None:
             result = result + f"{lat:.6f}, {lon:.6f} "
             if dist is not None:
-                if dir and dir != "un":
-                    dir_str = f"/{dir}"
+                if direction and direction != "un":
+                    dir_str = f"/{direction}"
                 else:
                     dir_str = ""
                 delta = ""
@@ -1452,7 +1451,9 @@ class MeshStatsTUI:
             result = result + f"{meshview_link}"
         return result
 
-    def build_detail_lines(self, node: RelayNodeStats) -> List[Tuple[str, int]]:
+    def build_detail_lines(  # pylint: disable=too-many-locals,too-many-branches,too-many-statements
+        self, node: RelayNodeStats
+    ) -> List[Tuple[str, int]]:
         """Build list of lines for detail view.
 
         Returns list of (text, color_pair) tuples.
@@ -1500,7 +1501,7 @@ class MeshStatsTUI:
                 lines.append(("", CP_NORMAL))
                 node_num = node_info.get("num")
                 if node_num is None:
-                    node_num = next((n for n, inf in self.stats._nodes_by_num.items() if inf is node_info), None)
+                    node_num = next((n for n, inf in self.stats.get_nodes().items() if inf is node_info), None)
                 node_num = node_num if node_num is not None else 0
                 lines.append((f"[{i+1}] Node !{node_num:08x}", CP_SECTION))
 
@@ -1521,9 +1522,6 @@ class MeshStatsTUI:
 
                 # Distance, altitude and bearing from get_node_location_info when we have current_pos
                 loc = self.stats.get_node_location_info(node_num, current_pos)
-                dist = loc.get("distance")
-                alt = loc.get("altitude")
-                bearing = loc.get("direction")
                 pos_line = self.render_position_oneline(node_num, loc, "    Position: ")
                 lines.append((pos_line, CP_NORMAL))
 
@@ -1539,9 +1537,8 @@ class MeshStatsTUI:
                     lines.append((f"    Last SNR in DB: {node_info['snr']:.1f} dB", CP_NORMAL))
 
                 if "lastHeard" in node_info:
-                    import datetime
                     ts = node_info["lastHeard"]
-                    dt = datetime.datetime.fromtimestamp(ts)
+                    dt = datetime.fromtimestamp(ts)
                     lines.append((f"    Last Heard in DB: {dt.strftime('%Y-%m-%d %H:%M:%S')}", CP_NORMAL))
 
                 # Firmware from node database
@@ -1550,7 +1547,7 @@ class MeshStatsTUI:
                     lines.append((f"    Firmware: {fw}", CP_NORMAL))
 
                 # Uptime, restarts and telemetry from received TELEMETRY_APP
-                trec = self.stats._node_telemetry.get(node_num)
+                trec = self.stats.get_node_telemetry().get(node_num)
                 if trec is not None:
                     if trec.last_uptime_seconds is not None:
                         secs = trec.last_uptime_seconds
@@ -1583,7 +1580,7 @@ class MeshStatsTUI:
                 reverse=True
             )
             for node_num, remote_stats in sorted_remotes:
-                node_info = self.stats._nodes_by_num.get(node_num)
+                node_info = self.stats.get_nodes().get(node_num)
                 short_name = ""
                 if node_info and "user" in node_info:
                     short_name = (node_info["user"].get("shortName", "") or "")[:8]
@@ -1599,7 +1596,7 @@ class MeshStatsTUI:
 
         return lines
 
-    def render_detail_view(self, win, node: RelayNodeStats, max_height: int, max_width: int) -> None:
+    def render_detail_view(self, win, node: RelayNodeStats, max_height: int, max_width: int) -> None:  # pylint: disable=too-many-locals
         """Render detailed view for a selected relay node with scrolling."""
         try:
             win.clear()
@@ -1746,12 +1743,12 @@ class MeshStatsTUI:
                     pass
         return confirmed
 
-    def handle_input(self, key: int) -> None:
+    def handle_input(self, key: int) -> None:  # pylint: disable=too-many-branches,too-many-statements,too-many-nested-blocks
         """Handle keyboard input."""
         nodes = self.stats.get_sorted_nodes()
         num_nodes = len(nodes)
 
-        if self.show_details:
+        if self.show_details:  # pylint: disable=too-many-nested-blocks
             # In detail view: scroll with Up/Down, return with Enter/Escape, [1]-[9],[0] to skip node
             if key == curses.KEY_UP:
                 self.detail_scroll_offset = max(0, self.detail_scroll_offset - 1)
@@ -1781,7 +1778,7 @@ class MeshStatsTUI:
                         node_info = matching_nodes[match_index]
                         node_num = node_info.get("num")
                         if node_num is None:
-                            node_num = next((n for n, inf in self.stats._nodes_by_num.items() if inf is node_info), None)
+                            node_num = next((n for n, inf in self.stats.get_nodes().items() if inf is node_info), None)
                         if node_num is not None and self._confirm_popup(f"Skip node !{node_num:08x}? (y/n)"):
                             self.stats.add_skipped_relay_node(node_num, "user")
                             self._detail_lines_cache = None
@@ -1869,7 +1866,7 @@ class PacketWriter:
         The file is opened in binary write mode ('wb'); any existing file
         with the same path will be overwritten.
         """
-        self.file = open(self.filename, 'wb')
+        self.file = open(self.filename, 'wb')  # pylint: disable=consider-using-with
         self.packet_count = 0
         header = ('__nodedb__', nodes_by_num or {}, db_load_time, local_position)
         pickle.dump(header, self.file, protocol=pickle.HIGHEST_PROTOCOL)
@@ -1935,7 +1932,7 @@ class PacketReplayer:
                                 if self.local_position:
                                     print(f"Loaded local position: {self.local_position}")
                                 continue
-                            elif isinstance(record, tuple) and len(record) == 2:
+                            if isinstance(record, tuple) and len(record) == 2:
                                 self.packets.append(record)
                         elif isinstance(record, tuple) and len(record) == 2:
                             self.packets.append(record)
@@ -2021,7 +2018,7 @@ def connect_ble(address: str):
     return interface
 
 
-def wait_for_node_db(interface, timeout: int = 30) -> None:
+def wait_for_node_db(interface) -> None:
     """Wait for node database to be loaded."""
     print("Waiting for node database to load...")
     try:
@@ -2049,7 +2046,8 @@ def parse_meshtastic_node_id(value: str) -> int:
     return int(s, 16)
 
 
-def main():
+def main():  # pylint: disable=too-many-branches,too-many-statements
+    """Parse arguments, set up stats/replay/writer, run TUI."""
     parser = argparse.ArgumentParser(
         description="Meshtastic Relay Node Statistics TUI",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -2176,7 +2174,7 @@ Examples:
             if packet_writer:
                 # Save node database along with packets, including local position
                 local_pos = stats.get_local_node_position()
-                packet_writer.open(stats._nodes_by_num, stats.db_load_time, local_pos)
+                packet_writer.open(stats.get_nodes(), stats.db_load_time, local_pos)
 
         print("Starting TUI...")
         time.sleep(0.5)
@@ -2198,7 +2196,7 @@ Examples:
         if interface:
             try:
                 interface.close()
-            except:
+            except Exception:
                 pass
         print("Disconnected.")
 
