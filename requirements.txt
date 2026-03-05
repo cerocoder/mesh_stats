@@ -1,0 +1,5 @@
+# Meshtastic Relay Node Statistics (mesh_stats.py)
+# Python 3.8+
+
+meshtastic
+pypubsub
