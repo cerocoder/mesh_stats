@@ -415,31 +415,7 @@ class StatsCollector:  # pylint: disable=too-many-public-methods
         with self.lock:
             self._update_relay_node_name_held(relay_byte)
 
-    def _wait_for_node_db_stable(
-        self,
-        poll_interval: float = 0.4,
-        stable_interval: float = 1.2,
-        timeout: float = 15.0,
-    ) -> None:
-        """Wait until interface.nodesByNum count is stable (no new nodes for stable_interval).
-
-        waitForConfig() returns when device config is ready; node DB can still be
-        streaming in. This waits until the count stops changing before we snapshot.
-        """
-        deadline = time.time() + timeout
-        last_count = -1
-        count_stable_since = time.time()
-        while time.time() < deadline:
-            n = len(self.interface.nodesByNum)
-            if n == last_count:
-                if time.time() - count_stable_since >= stable_interval:
-                    return
-            else:
-                last_count = n
-                count_stable_since = time.time()
-            time.sleep(poll_interval)
-
-    def reload_node_database(self) -> bool:
+    def reload_node_database(self, use_ready_db: bool = True) -> bool:
         """Reload the node database from the connected device.
 
         Takes a snapshot of interface.nodesByNum after config and node DB are stable
@@ -449,13 +425,13 @@ class StatsCollector:  # pylint: disable=too-many-public-methods
         if self.interface is None:
             return False
         try:
-            # Request fresh config from device (meshtastic API uses _startConfig)
-            getattr(self.interface, '_startConfig', lambda: None)()
-            # Wait for config to complete
-            self.interface.waitForConfig()
-            # Wait for node DB to stop growing (nodes stream in after config)
-            self._wait_for_node_db_stable()
-            # Snapshot nodesByNum under lock; use this copy for all lookups
+            if not use_ready_db:
+                # Request fresh config from device (meshtastic API uses _startConfig)
+                # TODO: fix it further, as it doesn't work well
+                getattr(self.interface, '_startConfig', lambda: None)()
+                # Wait for config to complete
+                self.interface.waitForConfig()
+                # Snapshot nodesByNum under lock; use this copy for all lookups
             with self.lock:
                 self._nodes_by_num = dict(self.interface.nodesByNum)
                 self.db_load_time = time.time()

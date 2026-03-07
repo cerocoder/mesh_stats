@@ -268,5 +268,7 @@ If no timestamp is available, only the source is shown (e.g. “Src: DB”) with
 
 - **Serial port:** On Linux, you may need to be in the `dialout` group or use `sudo`. Use the correct device path (e.g. `/dev/ttyACM0`, `/dev/ttyUSB0`).
 - **BLE:** Use the device name (e.g. `Meshtastic_abcd`) or Bluetooth address. Some Linux systems have limited BLE support.
+- **BLE:** Ony one device can be connected to meshtastics node thorough Bluetooth.
 - **“No matching nodes” in detail:** The relay may not have sent nodeinfo yet, or it might not be in the local node DB.
 - **Replay:** The `.dat` file must have been recorded with `-w` by this (or a compatible) version of the utility.
+- **DB**  reload command doesn't force reloading base, just updates DB snapshot.
