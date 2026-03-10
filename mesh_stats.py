@@ -33,6 +33,74 @@ BAR_WIDTH = 40
 # Time window (seconds) for "just received" flash effect (inverse color)
 FLASH_DURATION = 0.5
 
+# Screen refresh period (seconds); used for curses timeout and ReplayTime advance
+SCREEN_UPDATE_PERIOD_SEC = 0.25
+
+
+class AssignTimeNotAllowedError(Exception):
+    """Raised when assign_time() is called on SimpleTime (online mode)."""
+
+
+class BaseTimeHolder:
+    """Base class for current-time source. Global instance set in main() after CLI parse."""
+    def __init__(self) -> None:
+        self._time: Optional[float] = None
+
+    def get_time(self) -> float:
+        """Return current time (Unix timestamp). Override in derived classes."""
+        return time.time() if self._time is None else self._time
+
+    def update_time(self) -> None:
+        """Update/increment internal time (called each screen update). Override in derived classes."""
+        raise NotImplementedError
+
+    def assign_time(self, timestamp: float) -> None:
+        """Set internal time to timestamp. Override in derived classes."""
+        raise NotImplementedError
+
+
+class SimpleTime(BaseTimeHolder):
+    """Time holder for online receiving from node: tracks system time each frame."""
+    def get_time(self) -> float:
+        return self._time if self._time is not None else time.time()
+
+    def update_time(self) -> None:
+        self._time = time.time()
+
+    def assign_time(self, timestamp: float) -> None:
+        raise AssignTimeNotAllowedError("assign_time not allowed in online (SimpleTime) mode")
+
+
+class ReplayTime(BaseTimeHolder):
+    """Time holder for replay: set from packet timestamps, advanced each frame by period * speed."""
+    def __init__(self, time_multiply_factor: float) -> None:
+        super().__init__()
+        self._speed = time_multiply_factor
+        self._assigned = threading.Event()
+
+    def get_time(self) -> float:
+        if self._time is None:
+            self._assigned.wait()
+        return self._time if self._time is not None else 0.0
+
+    def update_time(self) -> None:
+        if self._time is not None:
+            self._time += SCREEN_UPDATE_PERIOD_SEC * self._speed
+
+    def assign_time(self, timestamp: float) -> None:
+        self._time = timestamp
+        self._assigned.set()
+
+
+_time_holder: Optional[BaseTimeHolder] = None
+
+
+def get_time_holder() -> BaseTimeHolder:
+    """Return the global time holder (set in main() after CLI parse)."""
+    if _time_holder is None:
+        raise RuntimeError("Time holder not initialized; call after parsing CLI and creating holder")
+    return _time_holder
+
 # Spinner characters for packet receive indicator
 SPINNER_CHARS = ['|', '/', '-', '\\']
 
@@ -171,7 +239,7 @@ class PositionMessage:
         if "longitudeI" in raw:
             raw["longitude"] = float(raw["longitudeI"] * Decimal("1e-7"))
         self.raw = raw
-        self.timestamp = time.time()
+        self.timestamp = get_time_holder().get_time()
         self.latitude = raw.get("latitude")
         self.longitude = raw.get("longitude")
         # Altitude: from Meshtastic Position protobuf.
@@ -286,6 +354,7 @@ class RelayNodeStats:
     packet_count: int = 0
     first_packet_time: float = 0.0
     last_packet_time: float = 0.0
+    last_packet_timestamp_for_flash: float = 0.0  # system time for flash duration only
     # Remote node number (packet "from") -> statistics for that remote node
     from_node_stats: Dict[int, RemoteNodeStats] = field(default_factory=dict)
 
@@ -304,10 +373,11 @@ class RelayNodeStats:
                hop_start: Optional[int] = None,
                hop_limit: Optional[int] = None) -> None:
         """Update statistics with new packet data."""
-        now = time.time()
+        now = get_time_holder().get_time()
         if self.packet_count == 0:
             self.first_packet_time = now
         self.last_packet_time = now
+        self.last_packet_timestamp_for_flash = time.time()
         self.packet_count += 1
         if from_node is not None:
             if from_node not in self.from_node_stats:
@@ -331,10 +401,10 @@ class RelayNodeStats:
 
     @property
     def just_received(self) -> bool:
-        """Check if a packet was received within the flash duration."""
-        if self.last_packet_time == 0:
+        """Check if a packet was received within the flash duration (uses system time)."""
+        if self.last_packet_timestamp_for_flash == 0:
             return False
-        return (time.time() - self.last_packet_time) < FLASH_DURATION
+        return (time.time() - self.last_packet_timestamp_for_flash) < FLASH_DURATION
 
     def reset(self) -> None:
         """Reset all statistics."""
@@ -343,6 +413,7 @@ class RelayNodeStats:
         self.packet_count = 0
         self.first_packet_time = 0.0
         self.last_packet_time = 0.0
+        self.last_packet_timestamp_for_flash = 0.0
         self.from_node_stats.clear()
 
 
@@ -393,6 +464,16 @@ class StatsCollector:  # pylint: disable=too-many-public-methods
         self._node_telemetry: Dict[int, NodeTelemetryRecord] = {}
         # Last LocalStats from local device (when TELEMETRY_APP from my node)
         self._local_stats_last: Optional[Dict] = None
+        # Replay mode: True when all packets have been replayed (set by PacketReplayer)
+        self._replay_finished: bool = False
+
+    def set_replay_finished(self, finished: bool) -> None:
+        """Set whether replay has finished (all packets replayed). Called by PacketReplayer."""
+        self._replay_finished = finished
+
+    def is_replay_finished(self) -> bool:
+        """Return True if in replay mode and all packets have been replayed."""
+        return self._replay_finished
 
     def add_skipped_relay_node(self, node_num: int, skip_value="persist") -> None:
         """Add node to the skipped node list. These nodes cannot be tractated as relays"""
@@ -434,7 +515,7 @@ class StatsCollector:  # pylint: disable=too-many-public-methods
                 # Snapshot nodesByNum under lock; use this copy for all lookups
             with self.lock:
                 self._nodes_by_num = dict(self.interface.nodesByNum)
-                self.db_load_time = time.time()
+                self.db_load_time = get_time_holder().get_time()
                 relay_bytes = list(self.nodes.keys())
             for relay_byte in relay_bytes:
                 self.refresh_relay_node_name(relay_byte)
@@ -797,7 +878,7 @@ class StatsCollector:  # pylint: disable=too-many-public-methods
         Stores position messages for each node.
         Only updates relay node statistics for packets that have a relayNode attribute.
         """
-        current_time = time.time()
+        current_time = get_time_holder().get_time()
 
         # Paused means no packet received, all of them are dropped
         if self.paused:
@@ -1282,7 +1363,7 @@ class MeshStatsTUI:
                     pass
 
                 # Row 2: time since last packet
-                elapsed = time.time() - node.last_packet_time
+                elapsed = get_time_holder().get_time() - node.last_packet_time
                 if elapsed < 60:
                     since_str = f"{int(elapsed):>3}s ago"
                 elif elapsed < 3600:
@@ -1311,9 +1392,12 @@ class MeshStatsTUI:
         # Title line
         title = " Meshtastic Relay Node Statistics "
         # Spinner placed 2 chars before "Total"
-        status = f"{spinner} Total: {total} | Relayed: {total_relayed} | Sort: {sort_name}"
+        total_label = "Finish:" if (self.replay_mode and self.stats.is_replay_finished()) else "Total:"
+        status = f"{spinner} {total_label} {total} | Relayed: {total_relayed} | Sort: {sort_name}"
         if paused:
             status += " | PAUSED"
+        time_str = datetime.fromtimestamp(get_time_holder().get_time()).strftime("%H:%M:%S")
+        time_prefix = f"[{time_str}] "
 
         try:
             win.addstr(0, 0, "=" * max_width, curses.color_pair(COLOR_HEADER))
@@ -1321,6 +1405,9 @@ class MeshStatsTUI:
             # DB load time after title
             db_info = f" DB({db_cnt}): {db_time} "
             win.addstr(0, len(title) + 4, db_info, curses.color_pair(COLOR_HEADER))
+            # App time left of status line (running pipe stays in same place)
+            win.addstr(0, max_width - len(status) - len(time_prefix) - 2, time_prefix,
+                       curses.color_pair(COLOR_HEADER))
             win.addstr(0, max_width - len(status) - 2, status, curses.color_pair(COLOR_PAUSED if paused else COLOR_HEADER))
 
             # Local node info (one line, above column headers)
@@ -1400,7 +1487,7 @@ class MeshStatsTUI:
         if src is not None:
             ts = loc_info.get("timestamp")
             if ts is not None:
-                elapsed = time.time() - ts
+                elapsed = get_time_holder().get_time() - ts
                 if elapsed < 60:
                     age_str = "1m"
                 elif elapsed < 5 * 60:
@@ -1710,7 +1797,7 @@ class MeshStatsTUI:
             confirmed = key in (ord('y'), ord('Y'))
         finally:
             self.stdscr.nodelay(True)
-            self.stdscr.timeout(250)
+            self.stdscr.timeout(int(SCREEN_UPDATE_PERIOD_SEC * 1000))
             if popup is not None:
                 try:
                     popup.clear()
@@ -1806,11 +1893,12 @@ class MeshStatsTUI:
         # Setup curses
         curses.curs_set(0)  # Hide cursor
         stdscr.nodelay(True)  # Non-blocking input
-        stdscr.timeout(250)  # Refresh every 250ms
+        stdscr.timeout(int(SCREEN_UPDATE_PERIOD_SEC * 1000))
 
         self.init_colors()
 
         while self.running:
+            get_time_holder().update_time()
             self.render()
 
             try:
@@ -1854,7 +1942,7 @@ class PacketWriter:
             return
         with self.lock:
             try:
-                record = (time.time(), dict(packet))
+                record = (get_time_holder().get_time(), dict(packet))
                 pickle.dump(record, self.file, protocol=pickle.HIGHEST_PROTOCOL)
                 self.file.flush()
                 self.packet_count += 1
@@ -1929,6 +2017,7 @@ class PacketReplayer:
         """Start replaying packets in a background thread."""
         if not self.packets:
             return
+        self.stats.set_replay_finished(False)
         self.running = True
         self.current_index = 0
         self.thread = threading.Thread(target=self._replay_loop, daemon=True)
@@ -1975,8 +2064,15 @@ class PacketReplayer:
                     time.sleep(delay)
             prev_timestamp = timestamp
 
+            get_time_holder().assign_time(timestamp)
             self.stats.on_receive(packet, None)
 
+        # Unblock get_time() when there are no packets or replay has finished,
+        # if even one packet arrived don't set current time, keep timecounter in
+        # the replaying epoche
+        if self.current_index == 0:
+            get_time_holder().assign_time(time.time())
+        self.stats.set_replay_finished(True)
         self.running = False
 
 
@@ -2112,6 +2208,13 @@ Examples:
         replayer = PacketReplayer(args.replay, stats, speed=args.speed if args.speed > 0 else float('inf'))
         if not replayer.load():
             sys.exit(1)
+
+    # Global time holder (online = system time, replay = packet-driven time)
+    global _time_holder  # pylint: disable=global-statement
+    if args.replay and replayer is not None:
+        _time_holder = ReplayTime(replayer.speed)
+    else:
+        _time_holder = SimpleTime()
 
     # Custom receive handler that also writes to file
     def on_receive_with_write(packet, interface):
