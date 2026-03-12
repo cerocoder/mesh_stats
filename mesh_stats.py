@@ -871,18 +871,20 @@ class StatsCollector:  # pylint: disable=too-many-public-methods
                 if my_node is not None and node_num == my_node:
                     self._local_stats_last = dict(ls)
 
-    def on_receive(self, packet, _interface) -> None:  # pylint: disable=too-many-locals,too-many-branches,too-many-statements
+    def on_receive(self, packet, _interface) -> bool:  # pylint: disable=too-many-locals,too-many-branches,too-many-statements
         """Handle received packet from meshtastic.
 
         Updates spinner and timestamps for all packets.
         Stores position messages for each node.
         Only updates relay node statistics for packets that have a relayNode attribute.
+        Return: True if packet has been received and False if it is not, for instance,
+                we don't receive packets during the pause
         """
         current_time = get_time_holder().get_time()
 
         # Paused means no packet received, all of them are dropped
         if self.paused:
-            return
+            return False
 
         # Always update spinner and last packet time (even when paused)
         with self.lock:
@@ -906,11 +908,11 @@ class StatsCollector:  # pylint: disable=too-many-public-methods
         # Only handle relay stats for packets with relayNode attribute
         relay_node_byte = packet.get("relayNode")
         if relay_node_byte is None:
-            return
+            return True
 
         # Skip invalid relay node (NO_RELAY_NODE = 0 means no relay info)
         if relay_node_byte == 0:
-            return
+            return True
 
         rx_snr = packet.get("rxSnr")
         rx_rssi = packet.get("rxRssi")
@@ -927,9 +929,9 @@ class StatsCollector:  # pylint: disable=too-many-public-methods
                 if hops_made != 1:
                     pass  # multi-hop: do not skip, count as relayed
                 else:
-                    return  # direct (one hop): skip
+                    return True # direct (one hop): skip
             else:
-                return  # no hop info: keep legacy behavior, skip
+                return  True # no hop info: keep legacy behavior, skip
 
         with self.lock:
             self.total_relayed_packets += 1
@@ -948,6 +950,7 @@ class StatsCollector:  # pylint: disable=too-many-public-methods
                 hop_limit=hop_limit
             )
             self._update_relay_node_name_held(relay_node_byte)
+        return True
 
     def toggle_pause(self) -> None:
         """Toggle pause state."""
@@ -2218,8 +2221,8 @@ Examples:
 
     # Custom receive handler that also writes to file
     def on_receive_with_write(packet, interface):
-        stats.on_receive(packet, interface)
-        if packet_writer:
+        write_enable = stats.on_receive(packet, interface)
+        if packet_writer and write_enable:
             packet_writer.write_packet(packet)
 
     # Subscribe to meshtastic receive events (only if using real device)
