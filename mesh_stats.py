@@ -618,6 +618,16 @@ class StatsCollector:  # pylint: disable=too-many-public-methods
         """Set the meshtastic interface for node info lookups."""
         self.interface = interface
 
+    def find_matching_node_nums(self, relay_node_byte: int) -> List[int]:
+        """Return node numbers whose last byte matches relay_node_byte, excluding skipped."""
+        nums = []
+        nodes_snapshot = self._nodes_by_num
+        for node_num in nodes_snapshot:
+            if get_last_byte_of_node_num(node_num) == relay_node_byte:
+                if not self.skip_relays.get(node_num, False):
+                    nums.append(node_num)
+        return nums
+
     def find_matching_nodes(self, relay_node_byte: int) -> List[Dict]:
         """Find all nodes in database whose last byte matches relay_node_byte.
 
@@ -1225,9 +1235,10 @@ class MeshStatsTUI:
         # Row 1: Hex ID with match count, packet count, rxSnr stats, rxSnr bar
         attr = curses.color_pair(COLOR_SELECTED) if is_selected else curses.color_pair(COLOR_NORMAL)
 
-        # Selection indicator, hex ID, and match count
+        # Selection indicator, hex ID, and match count (non-skipped nodes only)
         prefix = ">" if is_selected else " "
-        match_count = len(self.stats.find_matching_nodes(node.relay_node_byte))
+        matching_nums = self.stats.find_matching_node_nums(node.relay_node_byte)
+        match_count = len(matching_nums)
         hex_str = f"{prefix}{node.hex_id}[{match_count}]"
         hex_str = f"{hex_str:<11}"
         try:
@@ -1239,15 +1250,10 @@ class MeshStatsTUI:
         distance, height = None, None
         current_pos = self.stats.get_local_node_position()
         if match_count == 1 and current_pos:
-            node_num = next(
-                (n for n in self.stats.get_nodes()
-                 if get_last_byte_of_node_num(n) == node.relay_node_byte),
-                None
-            )
-            if node_num is not None:
-                loc = self.stats.get_node_location_info(node_num, current_pos)
-                distance = loc.get("distance")
-                height = loc.get("altitude")
+            node_num = matching_nums[0]
+            loc = self.stats.get_node_location_info(node_num, current_pos)
+            distance = loc.get("distance")
+            height = loc.get("altitude")
 
         if distance is not None:
             range_str = f"{distance:>6.1f}km"
