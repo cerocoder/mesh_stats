@@ -7,6 +7,7 @@ Displays rxSnr and rxRssi statistics with visual bars for each relay node.
 """
 
 import argparse
+import json
 import curses
 import math
 import pickle
@@ -100,6 +101,49 @@ def get_time_holder() -> BaseTimeHolder:
     if _time_holder is None:
         raise RuntimeError("Time holder not initialized; call after parsing CLI and creating holder")
     return _time_holder
+
+
+def _packet_for_debug_json(packet: Dict) -> Dict:
+    """Build a new JSON-serializable object from important packet fields."""
+    out = {}
+    for key in ("from", "to", "id", "rxSnr", "rxRssi", "relayNode", "hopStart", "hopLimit"):
+        if key in packet and packet[key] is not None:
+            val = packet[key]
+            if isinstance(val, (int, float, str, bool)):
+                out[key] = val
+            elif isinstance(val, bytes):
+                out[key] = list(val)
+            elif isinstance(val, (list, tuple)):
+                out[key] = list(val)
+    decoded = packet.get("decoded")
+    if isinstance(decoded, dict):
+        dec_out = {}
+        if "portnum" in decoded:
+            dec_out["portnum"] = decoded["portnum"]
+        if "payload" in decoded:
+            pay = decoded["payload"]
+            dec_out["payload"] = list(pay) if isinstance(pay, bytes) else pay
+        def _serializable_val(v):
+            if isinstance(v, (int, float, str, bool, type(None))):
+                return v
+            if isinstance(v, bytes):
+                return list(v)
+            if isinstance(v, dict):
+                return {k: _serializable_val(x) for k, x in v.items() if k != "raw"}
+            if isinstance(v, (list, tuple)):
+                return [_serializable_val(x) for x in v]
+            return v
+
+        for key in ("position", "user", "telemetry", "admin", "routing"):
+            if key in decoded and decoded[key] is not None:
+                val = decoded[key]
+                if isinstance(val, dict):
+                    dec_out[key] = {k: _serializable_val(v) for k, v in val.items() if k != "raw"}
+                else:
+                    dec_out[key] = _serializable_val(val)
+        if dec_out:
+            out["decoded"] = dec_out
+    return out
 
 # Spinner characters for packet receive indicator
 SPINNER_CHARS = ['|', '/', '-', '\\']
@@ -417,6 +461,23 @@ class RelayNodeStats:
         self.from_node_stats.clear()
 
 
+@dataclass
+class NeighbourStat:
+    """Statistics for a neighbour (directly received packets from a node)."""
+    snr: SignalHistoryStat = field(default_factory=SignalHistoryStat)
+    rssi: SignalHistoryStat = field(default_factory=SignalHistoryStat)
+    packet_count: int = 0
+    last_packet_time: float = 0.0
+    last_packet_timestamp_for_flash: float = 0.0  # system time for flash duration only
+
+    @property
+    def just_received(self) -> bool:
+        """Check if a packet was received within the flash duration (uses system time)."""
+        if self.last_packet_timestamp_for_flash == 0:
+            return False
+        return (time.time() - self.last_packet_timestamp_for_flash) < FLASH_DURATION
+
+
 def get_last_byte_of_node_num(node_num: int) -> int:
     """Get last byte of node number, following firmware logic.
 
@@ -439,7 +500,7 @@ class StatsCollector:  # pylint: disable=too-many-public-methods
     """Collects and manages statistics for all relay nodes."""
 
     def __init__(self, meshview_url: Optional[str] = None):
-        self.nodes: Dict[int, RelayNodeStats] = {}
+        self.relays: Dict[int, RelayNodeStats] = {}
         self.total_packets: int = 0
         self.total_relayed_packets: int = 0
         self.paused: bool = False
@@ -466,6 +527,11 @@ class StatsCollector:  # pylint: disable=too-many-public-methods
         self._local_stats_last: Optional[Dict] = None
         # Replay mode: True when all packets have been replayed (set by PacketReplayer)
         self._replay_finished: bool = False
+        # Neighbours: directly received packets (no relay), key = node number
+        self.neighbour_stat: Dict[int, NeighbourStat] = {}
+        self.total_direct_packets: int = 0
+        # Debug: optional file to dump each received packet as JSON (one line per packet)
+        self._debug_file = None
 
     def set_replay_finished(self, finished: bool) -> None:
         """Set whether replay has finished (all packets replayed). Called by PacketReplayer."""
@@ -474,6 +540,23 @@ class StatsCollector:  # pylint: disable=too-many-public-methods
     def is_replay_finished(self) -> bool:
         """Return True if in replay mode and all packets have been replayed."""
         return self._replay_finished
+
+    def set_debug_file(self, stream) -> None:
+        """Set the file-like object to dump each received packet as JSON (one line per packet). None to disable."""
+        self._debug_file = stream
+
+    def _write_packet_to_debug_json(self, packet: Dict, current_time: float) -> None:
+        """If debug file is set, write one JSON line (timestamp + packet) and flush. No-op if _debug_file is None."""
+        if self._debug_file is None:
+            return
+        try:
+            packet_copy = _packet_for_debug_json(packet)
+            self._debug_file.write(
+                json.dumps({"timestamp": current_time, "packet": packet_copy}) + "\n"
+            )
+            self._debug_file.flush()
+        except Exception:
+            raise
 
     def add_skipped_relay_node(self, node_num: int, skip_value="persist") -> None:
         """Add node to the skipped node list. These nodes cannot be tractated as relays"""
@@ -488,8 +571,8 @@ class StatsCollector:  # pylint: disable=too-many-public-methods
 
     def _update_relay_node_name_held(self, relay_byte: int) -> None:
         """Update self.nodes[relay_byte].node_name. Call only with self.lock held."""
-        if relay_byte in self.nodes:
-            self.nodes[relay_byte].node_name = self.get_node_name(relay_byte)
+        if relay_byte in self.relays:
+            self.relays[relay_byte].node_name = self.get_node_name(relay_byte)
 
     def refresh_relay_node_name(self, relay_byte: int) -> None:
         """Update self.nodes[relay_byte].node_name with lock obtained."""
@@ -516,7 +599,7 @@ class StatsCollector:  # pylint: disable=too-many-public-methods
             with self.lock:
                 self._nodes_by_num = dict(self.interface.nodesByNum)
                 self.db_load_time = get_time_holder().get_time()
-                relay_bytes = list(self.nodes.keys())
+                relay_bytes = list(self.relays.keys())
             for relay_byte in relay_bytes:
                 self.refresh_relay_node_name(relay_byte)
             return True
@@ -672,6 +755,40 @@ class StatsCollector:  # pylint: disable=too-many-public-methods
         if len(matches) == 1:
             return matches[0]
         return None
+
+    def get_node_name_by_num(self, node_num: int) -> str:
+        """Get short name for a node by its full node number."""
+        info = self._nodes_by_num.get(node_num, {})
+        user = info.get("user") or {}
+        return user.get("shortName", "") or ""
+
+    def get_total_direct_packets(self) -> int:
+        """Return total count of directly received packets (for neighbour percentage)."""
+        with self.lock:
+            return self.total_direct_packets
+
+    def get_sorted_neighbours(self) -> List[Tuple[int, NeighbourStat]]:
+        """Get list of (node_num, NeighbourStat) sorted by current sort mode."""
+        with self.lock:
+            items = list(self.neighbour_stat.items())
+            total_direct = self.total_direct_packets
+            sort_mode = self.sort_mode
+
+        mode = SORT_MODES[sort_mode][0]
+        if mode == "pkts":
+            items.sort(key=lambda x: x[1].packet_count, reverse=True)
+        elif mode == "pct":
+            items.sort(key=lambda x: x[1].packet_count / total_direct if total_direct > 0 else 0,
+                      reverse=True)
+        elif mode == "snr":
+            items.sort(key=lambda x: x[1].snr.avg if x[1].snr.count > 0 else float('-inf'),
+                      reverse=True)
+        elif mode == "rssi":
+            items.sort(key=lambda x: x[1].rssi.avg if x[1].rssi.count > 0 else float('-inf'),
+                      reverse=True)
+        elif mode == "name":
+            items.sort(key=lambda x: self.get_node_name_by_num(x[0]) or f"!{x[0]:08x}")
+        return items
 
     def store_position(self, node_num: int, position_data: Dict) -> None:
         """Store a position message for a node.
@@ -896,13 +1013,13 @@ class StatsCollector:  # pylint: disable=too-many-public-methods
         if self.paused:
             return False
 
-        # Always update spinner and last packet time (even when paused)
+        # Always update spinner and last packet time
         with self.lock:
             self.spinner_index = (self.spinner_index + 1) % len(SPINNER_CHARS)
             self.last_packet_time = current_time
             self.total_packets += 1
 
-        # Check for position packets and store them (even when paused)
+        # Check for position packets and store them
         decoded = packet.get("decoded", {})
         portnum = decoded.get("portnum")
         from_node = packet.get("from")
@@ -915,20 +1032,32 @@ class StatsCollector:  # pylint: disable=too-many-public-methods
             if from_node is not None:
                 self._process_telemetry_packet(from_node, decoded, current_time)
 
-        # Only handle relay stats for packets with relayNode attribute
-        relay_node_byte = packet.get("relayNode")
-        if relay_node_byte is None:
-            return True
-
-        # Skip invalid relay node (NO_RELAY_NODE = 0 means no relay info)
-        if relay_node_byte == 0:
-            return True
-
         rx_snr = packet.get("rxSnr")
         rx_rssi = packet.get("rxRssi")
         # from_node = packet.get("from"), already got, see above
         hop_start = packet.get("hopStart")
         hop_limit = packet.get("hopLimit")
+
+        # Only handle relay stats for packets with relayNode attribute
+        relay_node_byte = packet.get("relayNode")
+        if relay_node_byte is None or relay_node_byte == 0 or \
+            (hop_start - hop_limit == 0 and get_last_byte_of_node_num(from_node) == relay_node_byte):
+            # Direct packet (no relay): update neighbour stats
+            if from_node is not None:
+                with self.lock:
+                    if from_node not in self.neighbour_stat:
+                        self.neighbour_stat[from_node] = NeighbourStat()
+                    nb = self.neighbour_stat[from_node]
+                    self.total_direct_packets += 1
+                    if rx_snr is not None:
+                        nb.snr.update(current_time, rx_snr)
+                    if rx_rssi is not None:
+                        nb.rssi.update(current_time, float(rx_rssi))
+                    nb.packet_count += 1
+                    nb.last_packet_time = current_time
+                    nb.last_packet_timestamp_for_flash = time.time()
+            self._write_packet_to_debug_json(packet, current_time)
+            return True
 
         # Skip packet if received from a node declared as non-relay (skip_relays), when it
         # looks like a directly received packet. Use hop_start/hop_limit when present:
@@ -947,19 +1076,20 @@ class StatsCollector:  # pylint: disable=too-many-public-methods
             self.total_relayed_packets += 1
             self.last_relayed_packet_time = current_time
 
-            if relay_node_byte not in self.nodes:
-                self.nodes[relay_node_byte] = RelayNodeStats(
+            if relay_node_byte not in self.relays:
+                self.relays[relay_node_byte] = RelayNodeStats(
                     relay_node_byte=relay_node_byte,
                     node_name=self.get_node_name(relay_node_byte)
                 )
 
-            self.nodes[relay_node_byte].update(
+            self.relays[relay_node_byte].update(
                 rx_snr, rx_rssi,
                 from_node=from_node,
                 hop_start=hop_start,
                 hop_limit=hop_limit
             )
             self._update_relay_node_name_held(relay_node_byte)
+        self._write_packet_to_debug_json(packet, current_time)
         return True
 
     def toggle_pause(self) -> None:
@@ -970,7 +1100,7 @@ class StatsCollector:  # pylint: disable=too-many-public-methods
     def reset(self) -> None:
         """Reset all statistics."""
         with self.lock:
-            self.nodes.clear()
+            self.relays.clear()
             self.total_packets = 0
             self.total_relayed_packets = 0
             self.spinner_index = 0
@@ -979,6 +1109,8 @@ class StatsCollector:  # pylint: disable=too-many-public-methods
             self._node_positions.clear()
             self._node_telemetry.clear()
             self._local_stats_last = None
+            self.neighbour_stat.clear()
+            self.total_direct_packets = 0
 
     def cycle_sort_mode(self) -> None:
         """Cycle to next sort mode."""
@@ -988,7 +1120,7 @@ class StatsCollector:  # pylint: disable=too-many-public-methods
     def get_sorted_nodes(self) -> List[RelayNodeStats]:
         """Get list of nodes sorted by current sort mode."""
         with self.lock:
-            nodes = list(self.nodes.values())
+            nodes = list(self.relays.values())
             total = self.total_relayed_packets
 
         mode = SORT_MODES[self.sort_mode][0]
@@ -1139,6 +1271,7 @@ class MeshStatsTUI:
         self.selected_index: int = 0
         self.scroll_offset: int = 0
         self.show_details: bool = False
+        self.show_neighbours: bool = False
         self.detail_scroll_offset: int = 0  # Scroll position in detail view
         self.running: bool = True
         self.stdscr = None
@@ -1388,21 +1521,161 @@ class MeshStatsTUI:
                 except curses.error:
                     pass
 
-    def render_header(self, win, max_width: int) -> None:  # pylint: disable=too-many-locals
-        """Render the header section."""
+    def render_neighbour_row(  # pylint: disable=too-many-locals,too-many-branches
+        self, win, row: int, node_num: int, neighbour: NeighbourStat,
+        total_direct: int, is_selected: bool, max_width: int
+    ) -> None:
+        """Render two rows for a single neighbour (direct packets)."""
+        name_col = 1
+        range_col = 13
+        cnt_col = 21
+        known_col = 27
+        stats_col = 34
+        bar_col = 52
+        last_col = bar_col + BAR_WIDTH + 1
+
+        attr = curses.color_pair(COLOR_SELECTED) if is_selected else curses.color_pair(COLOR_NORMAL)
+        prefix = ">" if is_selected else " "
+        node_id_str = f"!{node_num:08x}"
+        try:
+            win.addstr(row, name_col, f"{prefix}{node_id_str:<10}", attr)
+        except curses.error:
+            pass
+
+        current_pos = self.stats.get_local_node_position()
+        distance, height = None, None
+        if current_pos:
+            loc = self.stats.get_node_location_info(node_num, current_pos)
+            distance = loc.get("distance")
+            height = loc.get("altitude")
+
+        if distance is not None:
+            range_str = f"{distance:>6.1f}km"
+        else:
+            range_str = "   N/A"
+        try:
+            win.addstr(row, range_col, range_str, attr)
+        except curses.error:
+            pass
+
+        cnt_str = f"{neighbour.packet_count:>5}"
+        try:
+            win.addstr(row, cnt_col, cnt_str, attr)
+        except curses.error:
+            pass
+
+        try:
+            win.addstr(row, known_col, "     ", attr)
+        except curses.error:
+            pass
+
+        if neighbour.snr.count > 0:
+            snr_str = f"{neighbour.snr.min_val:>4.0f}/{neighbour.snr.avg:>4.1f}/{neighbour.snr.max_val:>4.0f}"
+        else:
+            snr_str = "  --/  --/  --"
+        try:
+            win.addstr(row, stats_col, snr_str, attr)
+        except curses.error:
+            pass
+
+        if bar_col + BAR_WIDTH < max_width:
+            if self.vis_mode == VIS_MODE_SIMPLE:
+                render_bar_simple(win, row, bar_col, neighbour.snr,
+                                 SNR_SCALE_MIN, SNR_SCALE_MAX, COLOR_SNR_BAR)
+            else:
+                render_bar_complex(win, row, bar_col, neighbour.snr,
+                                  SNR_SCALE_MIN, SNR_SCALE_MAX,
+                                  COLOR_SNR_BAR, COLOR_SNR_INDICATOR,
+                                  COLOR_SNR_INDICATOR_FLASH, neighbour.just_received)
+
+        row2 = row + 1
+        name_display = (self.stats.get_node_name_by_num(node_num) or "")[:10]
+        try:
+            win.addstr(row2, name_col, f" {name_display:<10}", attr)
+        except curses.error:
+            pass
+
+        if height is not None:
+            height_str = f"{height:>5}m"
+        else:
+            height_str = "   N/A"
+        try:
+            win.addstr(row2, range_col, height_str, attr)
+        except curses.error:
+            pass
+
+        pct = (neighbour.packet_count / total_direct * 100) if total_direct > 0 else 0
+        pct_str = f"{pct:>4.1f}%"
+        try:
+            win.addstr(row2, cnt_col, pct_str, attr)
+        except curses.error:
+            pass
+
+        try:
+            win.addstr(row2, known_col, "     ", attr)
+        except curses.error:
+            pass
+
+        if neighbour.rssi.count > 0:
+            rssi_str = f"{neighbour.rssi.min_val:>4.0f}/{neighbour.rssi.avg:>4.1f}/{neighbour.rssi.max_val:>4.0f}"
+        else:
+            rssi_str = "  --/  --/  --"
+        try:
+            win.addstr(row2, stats_col, rssi_str, attr)
+        except curses.error:
+            pass
+
+        if bar_col + BAR_WIDTH < max_width:
+            if self.vis_mode == VIS_MODE_SIMPLE:
+                render_bar_simple(win, row2, bar_col, neighbour.rssi,
+                                 RSSI_SCALE_MIN, RSSI_SCALE_MAX, COLOR_RSSI_BAR)
+            else:
+                render_bar_complex(win, row2, bar_col, neighbour.rssi,
+                                  RSSI_SCALE_MIN, RSSI_SCALE_MAX,
+                                  COLOR_RSSI_BAR, COLOR_RSSI_INDICATOR,
+                                  COLOR_RSSI_INDICATOR_FLASH, neighbour.just_received)
+
+        if last_col < max_width - 8 and neighbour.last_packet_time > 0:
+            dt = datetime.fromtimestamp(neighbour.last_packet_time)
+            time_str = dt.strftime("%H:%M:%S")
+            try:
+                win.addstr(row, last_col, time_str, attr)
+            except curses.error:
+                pass
+            elapsed = get_time_holder().get_time() - neighbour.last_packet_time
+            if elapsed < 60:
+                since_str = f"{int(elapsed):>3}s ago"
+            elif elapsed < 3600:
+                mins = int(elapsed // 60)
+                secs = int(elapsed % 60)
+                since_str = f"{mins}m {secs:02d}s"
+            else:
+                hours = int(elapsed // 3600)
+                mins = int((elapsed % 3600) // 60)
+                since_str = f"{hours}h {mins:02d}m"
+            try:
+                win.addstr(row2, last_col, since_str, attr)
+            except curses.error:
+                pass
+
+    def render_header(self, win, max_width: int, neighbours_mode: bool = False) -> None:  # pylint: disable=too-many-locals
+        """Render the header section. neighbours_mode: show Neighbours status and column headers."""
         total = self.stats.get_total_packets()
         total_relayed = self.stats.get_total_relayed_packets()
+        total_direct = self.stats.get_total_direct_packets()
         paused = self.stats.is_paused()
         sort_name = SORT_MODES[self.stats.sort_mode][1]
         db_time = self.stats.get_db_load_time_str()
         db_cnt = self.stats.get_db_cnt()
         spinner = self.stats.get_spinner_char()
 
-        # Title line
         title = " Meshtastic Relay Node Statistics "
-        # Spinner placed 2 chars before "Total"
-        total_label = "Finish:" if (self.replay_mode and self.stats.is_replay_finished()) else "Total:"
-        status = f"{spinner} {total_label} {total} | Relayed: {total_relayed} | Sort: {sort_name}"
+        if neighbours_mode:
+            total_label = "Neighbours:"
+            status = f"{spinner} {total_label} {total_direct} direct | Sort: {sort_name}"
+        else:
+            total_label = "Finish:" if (self.replay_mode and self.stats.is_replay_finished()) else "Total:"
+            status = f"{spinner} {total_label} {total} | Relayed: {total_relayed} | Sort: {sort_name}"
         if paused:
             status += " | PAUSED"
         time_str = datetime.fromtimestamp(get_time_holder().get_time()).strftime("%H:%M:%S")
@@ -1411,35 +1684,34 @@ class MeshStatsTUI:
         try:
             win.addstr(0, 0, "=" * max_width, curses.color_pair(COLOR_HEADER))
             win.addstr(0, 2, title, curses.color_pair(COLOR_HEADER) | curses.A_BOLD)
-            # DB load time after title
             db_info = f" DB({db_cnt}): {db_time} "
             win.addstr(0, len(title) + 4, db_info, curses.color_pair(COLOR_HEADER))
-            # App time left of status line (running pipe stays in same place)
             win.addstr(0, max_width - len(status) - len(time_prefix) - 2, time_prefix,
                        curses.color_pair(COLOR_HEADER))
             win.addstr(0, max_width - len(status) - 2, status, curses.color_pair(COLOR_PAUSED if paused else COLOR_HEADER))
 
-            # Local node info (one line, above column headers)
             self.render_my_info(win, 1, max_width)
 
-            # Column headers
             win.addstr(2, 0, "-" * max_width, curses.color_pair(COLOR_NORMAL))
-            win.addstr(3, 1, "Relay", curses.color_pair(COLOR_HEADER))
+            if neighbours_mode:
+                win.addstr(3, 1, "NodeID", curses.color_pair(COLOR_HEADER))
+                win.addstr(4, 1, "Name", curses.color_pair(COLOR_HEADER))
+            else:
+                win.addstr(3, 1, "Relay", curses.color_pair(COLOR_HEADER))
             win.addstr(3, 13, "Range", curses.color_pair(COLOR_HEADER))
             win.addstr(4, 13, "Alt", curses.color_pair(COLOR_HEADER))
             win.addstr(3, 21, "Cnt", curses.color_pair(COLOR_HEADER))
-            win.addstr(3, 27, "Known", curses.color_pair(COLOR_HEADER))
-            win.addstr(4, 27, "nodes", curses.color_pair(COLOR_HEADER))
+            if not neighbours_mode:
+                win.addstr(3, 27, "Known", curses.color_pair(COLOR_HEADER))
+                win.addstr(4, 27, "nodes", curses.color_pair(COLOR_HEADER))
             win.addstr(3, 34, "min/avg/max", curses.color_pair(COLOR_HEADER))
 
-            # Bar scale headers
             bar_col = 52
             last_col = bar_col + BAR_WIDTH + 1
             snr_header = f"rxSnr: {SNR_SCALE_MIN} dB"
             snr_header_end = f"{SNR_SCALE_MAX:+d} dB"
             win.addstr(3, bar_col, snr_header, curses.color_pair(COLOR_HEADER))
             win.addstr(3, bar_col + BAR_WIDTH - len(snr_header_end), snr_header_end, curses.color_pair(COLOR_HEADER))
-            # Last column header
             win.addstr(3, last_col, "Last", curses.color_pair(COLOR_HEADER))
 
             rssi_header = f"rxRssi: {RSSI_SCALE_MIN} dBm"
@@ -1451,17 +1723,22 @@ class MeshStatsTUI:
         except curses.error:
             pass
 
-    def render_footer(self, win, y: int, max_width: int) -> None:
-        """Render the footer/help section."""
+    def render_footer(self, win, y: int, max_width: int, neighbours_mode: bool = False) -> None:
+        """Render the footer/help section. neighbours_mode: omit Enter Details."""
         vis_name = VIS_MODES[self.vis_mode][1]
         try:
             win.addstr(y, 0, "-" * max_width, curses.color_pair(COLOR_NORMAL))
-            if self.replay_mode:
-                help_str = f" [Up/Dn] Navigate | [Enter] Details | [S]ort | [M]ode:{vis_name} | [P]ause | [R]eset | [Q]uit | REPLAY "
+            if neighbours_mode:
+                if self.replay_mode:
+                    help_str = f" [Up/Dn] Navigate | [N] Relays | [S]ort | [M]ode:{vis_name} | [P]ause | [R]eset | [Q]uit | REPLAY "
+                else:
+                    help_str = f" [Up/Dn] Navigate | [N] Relays | [S]ort | [M]ode:{vis_name} | [D]B reload | [P]ause | [R]eset | [Q]uit "
             else:
-                help_str = f" [Up/Dn] Navigate | [Enter] Details | [S]ort | [M]ode:{vis_name} | [D]B reload | [P]ause | [R]eset | [Q]uit "
+                if self.replay_mode:
+                    help_str = f" [Up/Dn] Navigate | [Enter] Details | [N] Neighbours | [S]ort | [M]ode:{vis_name} | [P]ause | [R]eset | [Q]uit | REPLAY "
+                else:
+                    help_str = f" [Up/Dn] Navigate | [Enter] Details | [N] Neighbours | [S]ort | [M]ode:{vis_name} | [D]B reload | [P]ause | [R]eset | [Q]uit "
             win.addstr(y + 1, 0, help_str, curses.color_pair(COLOR_STATUS_BAR))
-            # Pad the rest of the line
             if len(help_str) < max_width:
                 win.addstr(y + 1, len(help_str), " " * (max_width - len(help_str)), curses.color_pair(COLOR_STATUS_BAR))
         except curses.error:
@@ -1747,12 +2024,35 @@ class MeshStatsTUI:
 
         nodes = self.stats.get_sorted_nodes()
         total_relayed = self.stats.get_total_relayed_packets()
+        neighbours = self.stats.get_sorted_neighbours()
+        total_direct = self.stats.get_total_direct_packets()
 
         if self.show_details and nodes and 0 <= self.selected_index < len(nodes):
             self.render_detail_view(self.stdscr, nodes[self.selected_index], max_height, max_width)
+        elif self.show_neighbours:
+            self.render_header(self.stdscr, max_width, neighbours_mode=True)
+            header_rows = 6
+            footer_rows = 2
+            available_rows = max_height - header_rows - footer_rows
+            max_visible = available_rows // 2
+            num_neighbours = len(neighbours)
+            if num_neighbours > 0:
+                self.selected_index = min(self.selected_index, num_neighbours - 1)
+                if self.selected_index < self.scroll_offset:
+                    self.scroll_offset = self.selected_index
+                elif self.selected_index >= self.scroll_offset + max_visible:
+                    self.scroll_offset = self.selected_index - max_visible + 1
+                visible_neighbours = neighbours[self.scroll_offset:self.scroll_offset + max_visible]
+                for i, (node_num, nb) in enumerate(visible_neighbours):
+                    row = header_rows + i * 2
+                    is_selected = (self.scroll_offset + i) == self.selected_index
+                    self.render_neighbour_row(
+                        self.stdscr, row, node_num, nb, total_direct, is_selected, max_width
+                    )
+            self.render_footer(self.stdscr, max_height - 2, max_width, neighbours_mode=True)
         else:
             # Render header (title + local node line + column headers = 6 rows)
-            self.render_header(self.stdscr, max_width)
+            self.render_header(self.stdscr, max_width, neighbours_mode=False)
 
             # Calculate available space for nodes (2 rows per node)
             header_rows = 6
@@ -1774,7 +2074,7 @@ class MeshStatsTUI:
                 self.render_node_row(self.stdscr, row, node, total_relayed, is_selected, max_width)
 
             # Render footer
-            self.render_footer(self.stdscr, max_height - 2, max_width)
+            self.render_footer(self.stdscr, max_height - 2, max_width, neighbours_mode=False)
 
         self.stdscr.refresh()
 
@@ -1869,31 +2169,59 @@ class MeshStatsTUI:
                             self._detail_lines_cache = None
                             self._detail_cache_node_byte = None
         else:
-            # In main view: Escape does NOT exit, only Q quits
-            if key == curses.KEY_UP and num_nodes > 0:
-                self.selected_index = max(0, self.selected_index - 1)
-            elif key == curses.KEY_DOWN and num_nodes > 0:
-                self.selected_index = min(num_nodes - 1, self.selected_index + 1)
-            elif key in (curses.KEY_ENTER, 10, 13) and num_nodes > 0:
-                self.show_details = True
-                self.detail_scroll_offset = 0
-                # Invalidate cache to rebuild lines for the selected node
-                self._detail_lines_cache = None
-                self._detail_cache_node_byte = None
-            elif key in (ord('p'), ord('P')):
-                self.stats.toggle_pause()
-            elif key in (ord('r'), ord('R')):
-                self.stats.reset()
-                self.selected_index = 0
-                self.scroll_offset = 0
-            elif key in (ord('s'), ord('S')):
-                self.stats.cycle_sort_mode()
-            elif key in (ord('m'), ord('M')):
-                self.vis_mode = (self.vis_mode + 1) % len(VIS_MODES)
-            elif key in (ord('d'), ord('D')) and not self.replay_mode:
-                self.stats.reload_node_database()
-            elif key in (ord('q'), ord('Q')):
-                self.running = False
+            # Toggle Neighbours / Relay view
+            if key in (ord('n'), ord('N')):
+                self.show_neighbours = not self.show_neighbours
+                if self.show_neighbours:
+                    self.selected_index = 0
+                    self.scroll_offset = 0
+                return
+            num_neighbours = len(self.stats.get_sorted_neighbours())
+            if self.show_neighbours:
+                # Neighbours view: Up/Down, no Details on Enter
+                if key == curses.KEY_UP and num_neighbours > 0:
+                    self.selected_index = max(0, self.selected_index - 1)
+                elif key == curses.KEY_DOWN and num_neighbours > 0:
+                    self.selected_index = min(num_neighbours - 1, self.selected_index + 1)
+                elif key in (ord('p'), ord('P')):
+                    self.stats.toggle_pause()
+                elif key in (ord('r'), ord('R')):
+                    self.stats.reset()
+                    self.selected_index = 0
+                    self.scroll_offset = 0
+                elif key in (ord('s'), ord('S')):
+                    self.stats.cycle_sort_mode()
+                elif key in (ord('m'), ord('M')):
+                    self.vis_mode = (self.vis_mode + 1) % len(VIS_MODES)
+                elif key in (ord('d'), ord('D')) and not self.replay_mode:
+                    self.stats.reload_node_database()
+                elif key in (ord('q'), ord('Q')):
+                    self.running = False
+            else:
+                # Relay view
+                if key == curses.KEY_UP and num_nodes > 0:
+                    self.selected_index = max(0, self.selected_index - 1)
+                elif key == curses.KEY_DOWN and num_nodes > 0:
+                    self.selected_index = min(num_nodes - 1, self.selected_index + 1)
+                elif key in (curses.KEY_ENTER, 10, 13) and num_nodes > 0:
+                    self.show_details = True
+                    self.detail_scroll_offset = 0
+                    self._detail_lines_cache = None
+                    self._detail_cache_node_byte = None
+                elif key in (ord('p'), ord('P')):
+                    self.stats.toggle_pause()
+                elif key in (ord('r'), ord('R')):
+                    self.stats.reset()
+                    self.selected_index = 0
+                    self.scroll_offset = 0
+                elif key in (ord('s'), ord('S')):
+                    self.stats.cycle_sort_mode()
+                elif key in (ord('m'), ord('M')):
+                    self.vis_mode = (self.vis_mode + 1) % len(VIS_MODES)
+                elif key in (ord('d'), ord('D')) and not self.replay_mode:
+                    self.stats.reload_node_database()
+                elif key in (ord('q'), ord('Q')):
+                    self.running = False
 
     def run(self, stdscr) -> None:
         """Main TUI loop."""
@@ -2191,6 +2519,12 @@ Examples:
         help="Skip node from relay list (Meshtastic id in hex: !xxxxxxxx or xxxxxxxx); can be repeated"
     )
 
+    parser.add_argument(
+        "--debug",
+        metavar="FILE",
+        help="Dump each received packet as JSON (one line per packet) to FILE; ignored when paused."
+    )
+
     args = parser.parse_args()
 
     if args.replay and (args.serial or args.ble):
@@ -2201,6 +2535,11 @@ Examples:
 
     # Create statistics collector
     stats = StatsCollector(meshview_url=args.meshview)
+
+    debug_file = None
+    if args.debug:
+        debug_file = open(args.debug, 'w', encoding='utf-8')
+        stats.set_debug_file(debug_file)
 
     if args.skip_relay:
         for node_num in args.skip_relay:
@@ -2281,6 +2620,11 @@ Examples:
             replayer.stop()
         if packet_writer:
             packet_writer.close()
+        if debug_file is not None:
+            try:
+                debug_file.close()
+            except Exception:
+                pass
         if interface:
             try:
                 interface.close()
